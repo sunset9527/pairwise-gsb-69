@@ -1,0 +1,286 @@
+import {
+	EMPTY,
+	EXPONENT,
+	FUNCTION,
+	INVALID_NUMBER,
+	INVALID_ROUND,
+	ROUND,
+	SPACE,
+	STRING,
+} from "./constants.js";
+import {
+	applyPrecisionHandling,
+	applyRounding,
+	calculateExponent,
+	calculateOptimizedValue,
+	decorateResult,
+	formatOutput,
+	getBaseConfiguration,
+	handleZeroValue,
+	resolveSymbol,
+} from "./helpers.js";
+
+/**
+ * Converts a file size in bytes to a human-readable string with appropriate units
+ * @param {number|string|bigint} arg - The file size in bytes to convert
+ * @param {Object} [options={}] - Configuration options for formatting
+ * @param {boolean} [options.bits=false] - If true, calculates bits instead of bytes
+ * @param {boolean} [options.pad=false] - If true, pads decimal places to match round parameter
+ * @param {number} [options.base=-1] - Number base (2 for binary, 10 for decimal, -1 for auto)
+ * @param {number} [options.round=2] - Number of decimal places to round to
+ * @param {string|boolean} [options.locale=""] - Locale for number formatting, true for system locale
+ * @param {Object} [options.localeOptions={}] - Additional options for locale formatting
+ * @param {string} [options.separator=""] - Custom decimal separator
+ * @param {string} [options.spacer=" "] - String to separate value and unit
+ * @param {Object} [options.symbols={}] - Custom unit symbols
+ * @param {string} [options.standard=""] - Unit standard to use (SI, IEC, JEDEC)
+ * @param {string} [options.output="string"] - Output format: "string", "array", "object", or "exponent"
+ * @param {boolean} [options.fullform=false] - If true, uses full unit names instead of abbreviations
+ * @param {Array} [options.fullforms=[]] - Custom full unit names
+ * @param {number} [options.exponent=-1] - Force specific exponent (-1 for auto)
+ * @param {string} [options.roundingMethod="round"] - Math rounding method to use
+ * @param {number} [options.precision=0] - Number of significant digits (0 for auto)
+ * @returns {string|Array|Object|number} Formatted file size based on output option
+ * @throws {TypeError} When arg is not a valid number, roundingMethod is invalid,
+ *   precision is out of range (1-100), or output is not a supported format
+ * @example
+ * filesize(1024) // "1.02 kB"
+ * filesize(1024, {bits: true}) // "8.19 kbit"
+ * filesize(1024, {output: "object"}) // {value: 1.02, symbol: "kB", exponent: 1, unit: "kB"}
+ *
+ * @remarks
+ * **Input coercion:** `arg` is coerced via `Number()`. Numeric strings, hex
+ *   (`"0x1F"`), binary (`"0b101"`), and octal (`"0o17"`) literals are parsed;
+ *   `null`, `""`, `" "`, `true`, `false`, and single-element arrays coerce to
+ *   their numeric value. `undefined`, `"1_000"`, and `"1000n"` throw `TypeError`.
+ *   A `bigint` that overflows `Number.MAX_SAFE_INTEGER` throws `TypeError`.
+ *
+ * **Option precedence:** When multiple options conflict, `standard` wins over
+ *   `base`; `fullform` wins over `symbols`; `locale` wins over `separator`;
+ *   and a missing `fullforms[e]` falls back to the default unit name.
+ */
+export function filesize(
+	arg,
+	{
+		bits = false,
+		pad = false,
+		base = -1,
+		round = 2,
+		locale = EMPTY,
+		localeOptions = {},
+		separator = EMPTY,
+		spacer = SPACE,
+		symbols = {},
+		standard = EMPTY,
+		output = STRING,
+		fullform = false,
+		fullforms = [],
+		exponent = -1,
+		roundingMethod = ROUND,
+		precision = 0,
+	} = {},
+) {
+	let e = exponent,
+		num,
+		result = [],
+		val = 0,
+		u = EMPTY;
+
+	num = Number(arg);
+
+	if (isNaN(num)) {
+		throw new TypeError(INVALID_NUMBER);
+	}
+
+	if (!isFinite(num)) {
+		throw new TypeError(INVALID_NUMBER);
+	}
+
+	const { isDecimal, ceil, actualStandard } = getBaseConfiguration(standard, base);
+
+	const full = fullform === true,
+		neg = num < 0,
+		roundingFunc = Math[roundingMethod];
+
+	if (typeof roundingFunc !== FUNCTION) {
+		throw new TypeError(INVALID_ROUND);
+	}
+
+	if (neg) {
+		num = -num;
+	}
+
+	if (num === 0) {
+		return handleZeroValue(
+			precision,
+			actualStandard,
+			bits,
+			symbols,
+			full,
+			fullforms,
+			output,
+			spacer,
+			pad,
+			round,
+		);
+	}
+
+	// Exponent calculation + clamp + precision adjustment
+	const { e: calculatedE, precision: precisionAdjusted } = calculateExponent(
+		num,
+		e,
+		exponent,
+		isDecimal,
+		precision,
+	);
+	e = calculatedE;
+	const autoExponent = exponent === -1 || isNaN(exponent);
+
+	const { result: valueResult, e: valueExponent } = calculateOptimizedValue(
+		num,
+		e,
+		isDecimal,
+		bits,
+		ceil,
+		autoExponent,
+	);
+	val = valueResult;
+	e = valueExponent;
+
+	// Rounding + auto-increment ceiling
+	const rounded = applyRounding(val, ceil, e, round, roundingFunc, autoExponent);
+	result[0] = rounded.value;
+	e = rounded.e;
+
+	// Precision handling
+	if (precisionAdjusted > 0) {
+		const precisionResult = applyPrecisionHandling(
+			result[0],
+			precisionAdjusted,
+			e,
+			num,
+			isDecimal,
+			bits,
+			ceil,
+			roundingFunc,
+			round,
+			exponent,
+		);
+		result[0] = precisionResult.value;
+		e = precisionResult.e;
+	}
+
+	// Return the exponent only after every adjustment that other output
+	// modes apply (bits auto-increment, rounding overflow, precision), so
+	// it always matches the exponent reported by object output.
+	if (output === EXPONENT) {
+		return e;
+	}
+
+	u = resolveSymbol(actualStandard, bits, e, isDecimal);
+	result[1] = u;
+
+	decorateResult(
+		result,
+		neg,
+		symbols,
+		locale,
+		localeOptions,
+		separator,
+		pad,
+		round,
+		full,
+		fullforms,
+		actualStandard,
+		e,
+		bits,
+		roundingFunc,
+	);
+
+	return formatOutput(result, e, u, output, spacer);
+}
+
+/**
+ * Creates a partially applied version of filesize with preset options
+ * @param {Object} [options={}] - Configuration options (same as filesize)
+ * @param {boolean} [options.bits=false] - If true, calculates bits instead of bytes
+ * @param {boolean} [options.pad=false] - If true, pads decimal places to match round parameter
+ * @param {number} [options.base=-1] - Number base (2 for binary, 10 for decimal, -1 for auto)
+ * @param {number} [options.round=2] - Number of decimal places to round to
+ * @param {string|boolean} [options.locale=""] - Locale for number formatting, true for system locale
+ * @param {Object} [options.localeOptions={}] - Additional options for locale formatting
+ * @param {string} [options.separator=""] - Custom decimal separator
+ * @param {string} [options.spacer=" "] - String to separate value and unit
+ * @param {Object} [options.symbols={}] - Custom unit symbols
+ * @param {string} [options.standard=""] - Unit standard to use (SI, IEC, JEDEC)
+ * @param {string} [options.output="string"] - Output format: "string", "array", "object", or "exponent"
+ * @param {boolean} [options.fullform=false] - If true, uses full unit names instead of abbreviations
+ * @param {Array} [options.fullforms=[]] - Custom full unit names
+ * @param {number} [options.exponent=-1] - Force specific exponent (-1 for auto)
+ * @param {string} [options.roundingMethod="round"] - Math rounding method to use
+ * @param {number} [options.precision=0] - Number of significant digits (0 for auto)
+ * @returns {Function} A function that takes a file size and returns formatted output
+ * @example
+ * const formatBytes = partial({round: 1, standard: "iec"});
+ * formatBytes(1024) // "1 KiB"
+ * formatBytes(2048) // "2 KiB"
+ * formatBytes(1536) // "1.5 KiB"
+ */
+export function partial({
+	bits = false,
+	pad = false,
+	base = -1,
+	round = 2,
+	locale = EMPTY,
+	separator = EMPTY,
+	spacer = SPACE,
+	standard = EMPTY,
+	output = STRING,
+	fullform = false,
+	exponent = -1,
+	roundingMethod = ROUND,
+	precision = 0,
+	localeOptions = {},
+	symbols = {},
+	fullforms = [],
+} = {}) {
+	/**
+	 * Safely clone an object using structuredClone with JSON fallback.
+	 * structuredClone can throw for functions, circular refs, etc.
+	 */
+	function safeClone(value) {
+		try {
+			return typeof structuredClone === "function"
+				? structuredClone(value)
+				: JSON.parse(JSON.stringify(value));
+		} catch {
+			return JSON.parse(JSON.stringify(value));
+		}
+	}
+
+	const cloned = {
+		localeOptions: safeClone(localeOptions),
+		symbols: safeClone(symbols),
+		fullforms: safeClone(fullforms),
+	};
+
+	return (arg) =>
+		filesize(arg, {
+			bits,
+			pad,
+			base,
+			round,
+			locale,
+			localeOptions: cloned.localeOptions,
+			separator,
+			spacer,
+			symbols: cloned.symbols,
+			standard,
+			output,
+			fullform,
+			fullforms: cloned.fullforms,
+			exponent,
+			roundingMethod,
+			precision,
+		});
+}
